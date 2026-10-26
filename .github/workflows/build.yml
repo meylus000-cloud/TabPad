@@ -1,0 +1,80 @@
+name: Build TabPad
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build APK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+          PLAT=$(ls -d "$SDK"/platforms/android-* | sort -V | tail -1)
+          AJAR="$PLAT/android.jar"
+          echo "build-tools: $BT"
+          echo "platform: $PLAT"
+          cd android
+          rm -rf build && mkdir -p build/classes
+          javac -encoding UTF-8 -source 8 -target 8 -bootclasspath "$AJAR" -d build/classes src/com/tabpad/*.java
+          "$BT/d8" --min-api 15 --lib "$AJAR" --output build $(find build/classes -name '*.class')
+          "$BT/aapt2" link -o build/app-unsigned.apk -I "$AJAR" --manifest AndroidManifest.xml \
+            --min-sdk-version 15 --target-sdk-version 15 --version-code 1 --version-name 1.0
+          cd build
+          zip -q app-unsigned.apk classes.dex
+          "$BT/zipalign" -f 4 app-unsigned.apk app-aligned.apk
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android \
+            -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TabPad"
+          "$BT/apksigner" sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --min-sdk-version 15 --out TabPad.apk app-aligned.apk
+          "$BT/apksigner" verify --verbose TabPad.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TabPad-apk
+          path: android/build/TabPad.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /target:winexe /optimize+ /codepage:65001 /out:TabPad.exe `
+            /reference:System.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll `
+            windows\TabPad.cs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item TabPad.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TabPad-exe
+          path: TabPad.exe
+
+  release:
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - name: Publish release "latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -y --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest out/TabPad-apk/TabPad.apk out/TabPad-exe/TabPad.exe \
+            --repo "$GITHUB_REPOSITORY" --title "TabPad (остання збірка)" \
+            --notes "TabPad.apk — для планшета, TabPad.exe — для ноутбука Windows."
